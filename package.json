@@ -1,0 +1,16 @@
+{
+  "name": "recruitiq-app-root",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install:all": "npm install && npm install --prefix frontend && npm install --prefix backend",
+    "install:bun": "bun install && bun install --cwd frontend && bun install --cwd backend",
+    "dev": "concurrently --kill-others \"npm run dev --prefix frontend\" \"npm run dev --prefix backend\"",
+    "dev:bun": "concurrently --kill-others \"bun --cwd frontend dev\" \"bun --cwd backend dev\"",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "dev:backend": "npm run dev --prefix backend"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

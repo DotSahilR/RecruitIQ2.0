@@ -24,6 +24,9 @@ backend/.env.*
 backend/uploads/*
 !backend/uploads/.gitkeep
 
+# Dataset
+dataset/candidates.jsonl
+
 # Wrangler / Cloudflare
 .wrangler/
 .dev.vars

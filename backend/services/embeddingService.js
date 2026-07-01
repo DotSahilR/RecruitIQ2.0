@@ -1,240 +1,142 @@
-/**
- * Embedding Service (Phase 4).
- *
- * Bridges between the AI provider (Voyage today) and the pgvector-backed
- * `embeddings` table. Also exposes similarity helpers used by the v2 scorer.
- *
- * Public surface:
- *   - embedCandidate(candidateId, text)        — generate + persist
- *   - embedJobDescription(jobId, text)        — generate + persist
- *   - getCandidateEmbedding(candidateId)       — fetch (or null)
- *   - getJobEmbedding(jobId)                   — fetch (or null)
- *   - cosineSimilarity(a, b)                   — raw [-1, 1]
- *   - semanticScore(candidateId, jobId)        — 0-100 (or null)
- *
- * Every method is safe to call — failures are logged and return null/false
- * rather than throwing, so callers (background workers, controllers) don't
- * need try/catch around embedding calls.
- */
-
 const pool = require("../db");
-const aiProvider = require("./aiProvider");
 
-const EMBED_MODEL = process.env.VOYAGE_MODEL || "voyage-3-lite";
-const VECTOR_DIM = parseInt(process.env.EMBED_DIM || "512", 10);
+let pipeline = null;
+let modelLoaded = false;
+const EMBED_BATCH_SIZE = 32;
 
-function formatVector(vec) {
-  if (!Array.isArray(vec) || vec.length === 0) return null;
-  return "[" + vec.map((n) => Number(n).toFixed(6)).join(",") + "]";
+function buildCandidateText(candidate) {
+  const profile = candidate.profile || {};
+  const skills = (candidate.skills || []).map(s => s.name).join(", ");
+  const careerDesc = (candidate.career_history || [])
+    .map(h => `${h.title} at ${h.company}: ${h.description || ""}`)
+    .join(" ");
+  return `${profile.headline || ""} ${profile.summary || ""} ${skills} ${careerDesc}`.trim();
 }
 
-function parseVector(value) {
-  if (!value) return null;
-  if (Array.isArray(value)) return value;
-  if (typeof value === "string") {
-    const trimmed = value.replace(/^\s*\[/, "").replace(/\]\s*$/, "");
-    if (!trimmed) return null;
-    const parts = trimmed.split(",").map((n) => Number(n));
-    if (parts.some((n) => Number.isNaN(n))) return null;
-    return parts;
+async function getPipeline() {
+  if (pipeline) return pipeline;
+  try {
+    const { pipeline: p } = await import("@xenova/transformers");
+    console.log("Loading embedding model (all-MiniLM-L6-v2)...");
+    pipeline = await p("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+    modelLoaded = true;
+    console.log("Embedding model loaded.");
+    return pipeline;
+  } catch (err) {
+    console.error("Failed to load embedding model:", err.message);
+    return null;
   }
-  return null;
+}
+
+async function generateEmbedding(text) {
+  const pipe = await getPipeline();
+  if (!pipe) return null;
+  try {
+    const result = await pipe(text, { pooling: "mean", normalize: true });
+    return Array.from(result.data);
+  } catch (err) {
+    console.error("Embedding generation error:", err.message);
+    return null;
+  }
+}
+
+async function generateEmbeddingsBatch(texts) {
+  const pipe = await getPipeline();
+  if (!pipe || texts.length === 0) return texts.map(() => null);
+  try {
+    const result = await pipe(texts, { pooling: "mean", normalize: true });
+    const data = result.data;
+    const dim = result.dims[result.dims.length - 1];
+    const embeddings = [];
+    for (let i = 0; i < texts.length; i++) {
+      embeddings.push(Array.from(data.slice(i * dim, (i + 1) * dim)));
+    }
+    return embeddings;
+  } catch (err) {
+    console.error("Batch embedding error:", err.message);
+    return texts.map(() => null);
+  }
 }
 
 function cosineSimilarity(a, b) {
-  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length || a.length === 0) {
-    return null;
-  }
-  let dot = 0, normA = 0, normB = 0;
+  if (!a || !b || a.length !== b.length) return 0;
+  let dot = 0, magA = 0, magB = 0;
   for (let i = 0; i < a.length; i++) {
     dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
   }
-  const denom = Math.sqrt(normA) * Math.sqrt(normB);
-  if (denom === 0) return 0;
-  return dot / denom;
+  const denom = Math.sqrt(magA) * Math.sqrt(magB);
+  return denom === 0 ? 0 : dot / denom;
 }
 
-function rawTextToEmbeddingInput(text) {
-  if (!text) return null;
-  const trimmed = String(text).trim();
-  if (trimmed.length < 20) return null;
-  return trimmed.slice(0, 20000);
-}
-
-/**
- * Build a richer embedding input from structured parsed data + raw text.
- * Structured fields are prepended so the embedder sees the headline role/skills
- * first, then the full resume body. Callers can pass parsed=null to embed
- * raw text only.
- */
-function buildEmbeddingText(parsed, rawText) {
-  const parts = [];
-  if (parsed && typeof parsed === "object") {
-    if (parsed.role) parts.push(String(parsed.role));
-    if (parsed.summary) parts.push(String(parsed.summary));
-    if (Array.isArray(parsed.skills) && parsed.skills.length) {
-      parts.push("Skills: " + parsed.skills.join(", "));
-    }
-    if (parsed.experience) {
-      parts.push(`${parsed.experience} years of experience`);
-    }
-    if (parsed.location) parts.push("Location: " + String(parsed.location));
-    if (parsed.name) parts.push("Name: " + String(parsed.name));
+async function generateAllEmbeddings() {
+  const pipe = await getPipeline();
+  if (!pipe) {
+    console.warn("Embedding model unavailable. Skipping embedding generation.");
+    return;
   }
-  const cleanRaw = rawText ? String(rawText).trim() : "";
-  if (cleanRaw.length > 100) parts.push(cleanRaw.slice(0, 18000));
-  return parts.join("\n").trim();
-}
 
-async function storeEmbedding({ candidateId, jobId, kind, vector, model }) {
-  const formatted = formatVector(vector);
-  if (!formatted) return false;
-  if (kind === "resume" && candidateId == null) return false;
-  if (kind === "jd" && jobId == null) return false;
+  const check = await pool.query(
+    "SELECT COUNT(*) as count FROM candidates WHERE embedding IS NULL"
+  );
 
-  const client = await pool.connect();
-  try {
-    await client.query(
-      `INSERT INTO embeddings (candidate_id, job_id, kind, vector, model)
-       VALUES ($1, $2, $3, $4::vector, $5)
-       ON CONFLICT DO NOTHING`,
-      [candidateId, jobId, kind, formatted, model]
+  if (parseInt(check.rows[0].count) === 0) {
+    console.log("All candidates already have embeddings.");
+    return;
+  }
+
+  console.log("Generating embeddings for all candidates...");
+  let total = 0;
+
+  while (true) {
+    const batch = await pool.query(
+      "SELECT id, candidate_id, profile, skills, career_history FROM candidates WHERE embedding IS NULL ORDER BY id LIMIT $1",
+      [EMBED_BATCH_SIZE]
     );
-    // Partial unique indexes mean ON CONFLICT cannot name a target; for true
-    // UPSERT we do an explicit UPDATE if the INSERT was a no-op.
-    if (kind === "resume") {
-      await client.query(
-        `UPDATE embeddings
-            SET vector = $1::vector, model = $2, created_at = NOW()
-          WHERE candidate_id = $3 AND kind = $4 AND job_id IS NULL`,
-        [formatted, model, candidateId, kind]
-      );
-    } else {
-      await client.query(
-        `UPDATE embeddings
-            SET vector = $1::vector, model = $2, created_at = NOW()
-          WHERE job_id = $3 AND kind = $4 AND candidate_id IS NULL`,
-        [formatted, model, jobId, kind]
-      );
+
+    if (batch.rows.length === 0) break;
+
+    const texts = batch.rows.map(r => buildCandidateText(r));
+    const ids = batch.rows.map(r => r.id);
+    const embeddings = await generateEmbeddingsBatch(texts);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (let i = 0; i < ids.length; i++) {
+        if (embeddings[i]) {
+          await client.query(
+            "UPDATE candidates SET embedding = $1, embedding_model = $2 WHERE id = $3",
+            [embeddings[i], "all-MiniLM-L6-v2", ids[i]]
+          );
+          total++;
+        }
+      }
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("Batch update error:", err.message);
+    } finally {
+      client.release();
     }
-    return true;
-  } finally {
-    client.release();
+
+    process.stdout.write(`\rEmbedded ${total} candidates...`);
   }
+
+  process.stdout.write("\n");
+  console.log(`Generated embeddings for ${total} candidates.`);
 }
 
-async function embedCandidate(candidateId, text) {
-  if (!aiProvider.isEmbedAvailable()) {
-    return { embedded: false, error: "embed-not-configured" };
-  }
-  const input = rawTextToEmbeddingInput(text);
-  if (!input) return { embedded: false, error: "insufficient-text" };
-
-  const t0 = Date.now();
-  const vector = await aiProvider.generateEmbedding(input);
-  if (!Array.isArray(vector)) {
-    console.log(`[embed] candidate=${candidateId} -> skip (no vector from ${aiProvider.embedName})`);
-    return { embedded: false, error: "embedder-returned-no-vector" };
-  }
-  if (vector.length !== VECTOR_DIM) {
-    console.log(`[embed] candidate=${candidateId} -> skip (dim ${vector.length} != ${VECTOR_DIM})`);
-    return { embedded: false, error: `dim-mismatch:${vector.length}!=${VECTOR_DIM}` };
-  }
-
-  try {
-    await storeEmbedding({
-      candidateId,
-      jobId: null,
-      kind: "resume",
-      vector,
-      model: EMBED_MODEL,
-    });
-    console.log(`[embed] candidate=${candidateId} -> stored (${VECTOR_DIM}-d via ${EMBED_MODEL}, ${Date.now() - t0}ms)`);
-    return { embedded: true };
-  } catch (err) {
-    console.error(`[embed] failed to store candidate ${candidateId}:`, err.message);
-    return { embedded: false, error: err.message };
-  }
-}
-
-async function embedJobDescription(jobId, text) {
-  if (!aiProvider.isEmbedAvailable()) {
-    return { embedded: false, error: "embed-not-configured" };
-  }
-  const input = rawTextToEmbeddingInput(text);
-  if (!input) return { embedded: false, error: "insufficient-text" };
-
-  const t0 = Date.now();
-  const vector = await aiProvider.generateEmbedding(input);
-  if (!Array.isArray(vector)) {
-    console.log(`[embed] job=${jobId} -> skip (no vector from ${aiProvider.embedName})`);
-    return { embedded: false, error: "embedder-returned-no-vector" };
-  }
-  if (vector.length !== VECTOR_DIM) {
-    console.log(`[embed] job=${jobId} -> skip (dim ${vector.length} != ${VECTOR_DIM})`);
-    return { embedded: false, error: `dim-mismatch:${vector.length}!=${VECTOR_DIM}` };
-  }
-
-  try {
-    await storeEmbedding({
-      candidateId: null,
-      jobId,
-      kind: "jd",
-      vector,
-      model: EMBED_MODEL,
-    });
-    console.log(`[embed] job=${jobId} -> stored (${VECTOR_DIM}-d via ${EMBED_MODEL}, ${Date.now() - t0}ms)`);
-    return { embedded: true };
-  } catch (err) {
-    console.error(`[embed] failed to store job ${jobId}:`, err.message);
-    return { embedded: false, error: err.message };
-  }
-}
-
-async function getCandidateEmbedding(candidateId) {
-  const { rows } = await pool.query(
-    `SELECT vector FROM embeddings
-      WHERE candidate_id = $1 AND kind = 'resume' AND job_id IS NULL
-      ORDER BY created_at DESC LIMIT 1`,
-    [candidateId]
-  );
-  return rows[0] ? parseVector(rows[0].vector) : null;
-}
-
-async function getJobEmbedding(jobId) {
-  const { rows } = await pool.query(
-    `SELECT vector FROM embeddings
-      WHERE job_id = $1 AND kind = 'jd' AND candidate_id IS NULL
-      ORDER BY created_at DESC LIMIT 1`,
-    [jobId]
-  );
-  return rows[0] ? parseVector(rows[0].vector) : null;
-}
-
-async function semanticScore(candidateId, jobId) {
-  const [candVec, jobVec] = await Promise.all([
-    getCandidateEmbedding(candidateId),
-    getJobEmbedding(jobId),
-  ]);
-  if (!candVec || !jobVec) return null;
-  const sim = cosineSimilarity(candVec, jobVec);
-  if (sim == null) return null;
-  // Map [-1, 1] → [0, 100]
-  return Math.round(((sim + 1) / 2) * 100);
+async function generateJdEmbedding(jdText) {
+  return await generateEmbedding(jdText);
 }
 
 module.exports = {
-  EMBED_MODEL,
-  VECTOR_DIM,
-  formatVector,
-  parseVector,
+  generateEmbedding,
+  generateAllEmbeddings,
+  generateJdEmbedding,
   cosineSimilarity,
-  buildEmbeddingText,
-  embedCandidate,
-  embedJobDescription,
-  getCandidateEmbedding,
-  getJobEmbedding,
-  semanticScore,
+  buildCandidateText,
+  getPipeline
 };

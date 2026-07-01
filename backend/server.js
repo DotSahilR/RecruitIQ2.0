@@ -3,108 +3,109 @@ const cors = require("cors");
 const path = require("path");
 require("dotenv").config();
 
-// Initialize DB (this automatically fires pool connection and table creation in db.js)
 const pool = require("./db");
-
-const resumeRoutes = require("./routes/resumeRoutes");
+const datasetLoader = require("./services/datasetLoader");
+const embeddingService = require("./services/embeddingService");
+const datasetRoutes = require("./routes/datasetRoutes");
 const jdRoutes = require("./routes/jdRoutes");
-const analysisRoutes = require("./routes/analysisRoutes");
-const authRoutes = require("./routes/authRoutes");
-const pipelineRoutes = require("./routes/pipelineRoutes");
-const notesRoutes = require("./routes/notesRoutes");
-const ocrWorker = require("./services/ocrWorker");
+const rankRoutes = require("./routes/rankRoutes");
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5002;
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:8080";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || FRONTEND_URL;
-const allowedOrigins = CORS_ORIGIN.split(",").map((origin) => origin.trim()).filter(Boolean);
+const allowedOrigins = CORS_ORIGIN.split(",").map((o) => o.trim()).filter(Boolean);
 
-// Enable CORS for frontend communications
 app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error(`CORS blocked origin: ${origin}`));
+  origin: (origin, cb) => {
+    if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS blocked origin: ${origin}`));
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
-// Body parsers
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-// Serve uploaded resumes statically if needed
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
-
-// Request logger — every request gets a one-liner once it completes.
-// Helpful for tracing which endpoint the frontend is hitting and how long it took.
 app.use((req, res, next) => {
   const start = Date.now();
   res.on("finish", () => {
     const ms = Date.now() - start;
-    const userTag = req.user ? `user=${req.user.id}` : "anon";
-    const status = res.statusCode;
-    const marker = status >= 500 ? "✗" : status >= 400 ? "⚠" : "✓";
-    console.log(`[http] ${marker} ${req.method} ${req.originalUrl} ${userTag} -> ${status} (${ms}ms)`);
+    const marker = res.statusCode >= 500 ? "✗" : res.statusCode >= 400 ? "⚠" : "✓";
+    console.log(`[http] ${marker} ${req.method} ${req.originalUrl} -> ${res.statusCode} (${ms}ms)`);
   });
   next();
 });
 
-// Mount API Routes
-app.use("/api/auth", authRoutes);
-app.use("/api/resumes", resumeRoutes);
+app.use("/api/dataset", datasetRoutes);
 app.use("/api/jd", jdRoutes);
-app.use("/api", pipelineRoutes);
-app.use("/api", notesRoutes);
-app.use("/api", analysisRoutes); // Exposes /api/analyze, /api/results, /api/candidates/:id
+app.use("/api", rankRoutes);
 
-// Health check (for uptime monitors / load balancers)
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", name: "RecruitIQ API" });
+  res.json({
+    status: "ok",
+    name: "RecruitIQ AI 2.0",
+    candidatesLoaded: global.candidatesLoaded || 0,
+    embeddingsReady: global.embeddingsReady || false,
+    datasetLoaded: global.datasetLoaded || false
+  });
 });
 
-// Root Route
+app.get("/api/status", async (req, res) => {
+  const result = await pool.query("SELECT COUNT(*) as count FROM candidates");
+  const embedResult = await pool.query("SELECT COUNT(*) as count FROM candidates WHERE embedding IS NOT NULL");
+  res.json({
+    candidatesLoaded: parseInt(result.rows[0].count),
+    embeddingsGenerated: parseInt(embedResult.rows[0].count),
+    datasetLoaded: global.datasetLoaded || false,
+    embeddingsReady: global.embeddingsReady || false
+  });
+});
+
 app.get("/", (req, res) => {
   res.json({
-    name: "RecruitIQ AI Resume Screening API",
-    version: "1.0.0",
+    name: "RecruitIQ AI 2.0 - Candidate Intelligence Platform",
+    version: "2.0.0",
     status: "online"
   });
 });
 
-// Global Error Handler
 app.use((err, req, res, next) => {
   console.error("Express Error Handler:", err.stack || err.message);
   res.status(500).json({ error: err.message || "An unexpected error occurred." });
 });
 
-// Boot Server
-app.listen(PORT, () => {
-  console.log("\n==========================================================");
-  console.log(`🚀 RECRUITIQ API SERVER RUNNING ON PORT: http://localhost:${PORT}`);
-  console.log(`🌐 Frontend allowed from: ${allowedOrigins.join(", ")}`);
-  console.log(`📁 Uploads stored in: ${path.join(__dirname, "uploads")}`);
-  console.log("==========================================================\n");
+async function startup() {
+  try {
+    await pool.initPromise;
 
-  // Start the OCR background worker (Phase 2). Polls every 5s for queued jobs.
-  // Disable with OCR_WORKER=off for tests or read-only deployments.
-  if (process.env.OCR_WORKER !== "off") {
-    ocrWorker.start();
-  }
-});
+    const count = await datasetLoader.loadDataset();
+    global.candidatesLoaded = count;
+    global.datasetLoaded = true;
 
-// Graceful shutdown — terminate tesseract worker so process exits cleanly.
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, async () => {
-    console.log(`\n[${signal}] shutting down…`);
-    try {
-      await ocrWorker.stop();
-    } catch (_) {
-      // ignore
+    app.listen(PORT, () => {
+      console.log(`\nServer running on http://localhost:${PORT}`);
+      console.log(`Frontend allowed from: ${allowedOrigins.join(", ")}`);
+
+      embeddingService.generateAllEmbeddings().then(() => {
+        global.embeddingsReady = true;
+        console.log("Embeddings generation complete. System ready for ranking.");
+      });
+    });
+
+    for (const signal of ["SIGINT", "SIGTERM"]) {
+      process.on(signal, () => {
+        console.log(`\n[${signal}] shutting down...`);
+        process.exit(0);
+      });
     }
-    process.exit(0);
-  });
+  } catch (err) {
+    console.error("Startup failed:", err.message);
+    app.listen(PORT, () => {
+      console.log(`\nServer running on http://localhost:${PORT} (with startup errors)`);
+    });
+  }
 }
+
+startup();
